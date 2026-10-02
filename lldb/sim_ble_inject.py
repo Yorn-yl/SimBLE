@@ -12,7 +12,8 @@ import socket
 import lldb
 
 LOADER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libSimBLELoader.dylib")
-BREAKPOINT_NAME = "sim-ble-bridge"
+# Breakpoint names cannot contain "-".
+BREAKPOINT_NAME = "sim_ble_bridge"
 
 
 def bridge_is_running():
@@ -41,7 +42,9 @@ def __lldb_init_module(debugger, internal_dict):
     dummy.GetBreakpointNames(names)
     if any(names.GetStringAtIndex(index) == BREAKPOINT_NAME for index in range(names.GetSize())):
         return
-    breakpoint = dummy.BreakpointCreateByName("UIApplicationMain")
+    # Xcode adopts by-name breakpoints into its own list, stripping this callback and saving them as
+    # plain breakpoints that stop every launch. It leaves regex breakpoints alone.
+    breakpoint = dummy.BreakpointCreateByRegex("^UIApplicationMain$", "UIKitCore")
     breakpoint.AddName(BREAKPOINT_NAME)
     breakpoint.SetAutoContinue(True)
     breakpoint.SetScriptCallbackFunction(f"{__name__}.on_application_main")
