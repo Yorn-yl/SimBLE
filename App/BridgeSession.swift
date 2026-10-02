@@ -150,8 +150,8 @@ final class BridgeSession: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
     private func decode(_ data: Data?, _ direction: PacketDirection, _ peripheral: CBPeripheral,
                         _ characteristic: CBCharacteristic) -> (name: String, messages: [DecodedMessage])? {
         guard let data else { return nil }
-        let context = PacketContext(service: characteristic.service?.uuid.uuidString ?? "", characteristic: characteristic.uuid.uuidString,
-                                    direction: direction)
+        let context = PacketContext(service: Self.decoderUUID(characteristic.service?.uuid),
+                                    characteristic: Self.decoderUUID(characteristic.uuid), direction: direction)
         let key = "\(direction)|\(readKey(peripheral, characteristic))"
         let generation = decoders.generation
         if streams[key]?.generation != generation {
@@ -160,6 +160,15 @@ final class BridgeSession: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
         }
         guard let stream = streams[key], let name = stream.name, let decoder = stream.decoder else { return nil }
         return (name, decoder.decode(data))
+    }
+
+    /// Devices may declare 16-bit UUIDs in their 128-bit form, which CoreBluetooth then prints in full;
+    /// plugins get the 4-digit form either way, as `PacketContext` documents.
+    private static func decoderUUID(_ uuid: CBUUID?) -> String {
+        guard let string = uuid?.uuidString else { return "" }
+        let base = "-0000-1000-8000-00805F9B34FB"
+        guard string.count == 36, string.hasPrefix("0000"), string.hasSuffix(base) else { return string }
+        return String(string.dropFirst(4).prefix(4))
     }
 
     private func label(_ peripheral: CBPeripheral?) -> String {
