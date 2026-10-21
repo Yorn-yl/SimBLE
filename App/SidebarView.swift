@@ -8,6 +8,7 @@ struct SidebarView: View {
     let model: AppModel
     @Binding var appFilter: String?
     @State private var isRefreshing: Bool = false
+    @AppStorage(PeripheralAccessCoordinator.sharingKey) private var allowSharing = false
 
     var body: some View {
         List(selection: $appFilter) {
@@ -121,6 +122,8 @@ struct SidebarView: View {
         }
         Label("Mac Bluetooth: \(BluetoothStateText.describe(model.server.bluetoothState))", systemImage: "antenna.radiowaves.left.and.right")
             .foregroundStyle(model.server.bluetoothState == .poweredOn ? Color.primary : Color.orange)
+        Toggle("Shared device connections (unsafe)", isOn: $allowSharing)
+            .help("Allow separate simulator apps to use the same physical peripheral. Notifications and protocol responses are not isolated. Disconnect existing clients to return to exclusive access.")
         if let installError = model.installError {
             Label("Install failed: \(installError)", systemImage: "exclamationmark.triangle.fill")
                 .foregroundStyle(.red)

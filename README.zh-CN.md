@@ -186,9 +186,18 @@ final class FooStreamDecoder: PacketDecoder {
   - delegate 回调在 App 指定的队列上触发。
 - **启动时的安装步骤：** Mac App 会把 loader、shim、钩子复制到 `~/Library/Application Support/SimBLE/`,并让 `~/.lldbinit` 指向那里，所以移动或重新编译 App 都不影响注入。删掉 `~/.lldbinit` 里含 `sim_ble_inject.py` 的那一行，就能卸载钩子。
 
+## 多模拟器、多 App 连接同一外设
+
+- **每个 App 独立的外设 UUID：** 每组“模拟器 UDID + App Bundle ID + Mac 真实外设”对应一个稳定的虚拟 `CBPeripheral.identifier`。扫描、连接回调和 `retrievePeripherals(withIdentifiers:)` 都使用这一映射，重启 SimBLE 后仍然有效。它仅用于模拟器的设备身份，不代表硬件地址或配对关系。旧版使用 Mac UUID 的 App 缓存需要重新扫描。
+- **默认独占连接：** 同一物理设备只允许一个模拟器 App 控制；同一 App 内多个 `CBCentralManager` 可以共同使用。其他 App 可以扫描或检索设备，但连接会明确报错，直到原持有者断开。
+- **可选共享模式（不安全）：** Bridge 侧栏提供 *Shared device connections (unsafe)*，用于专门测试多个客户端连接同一设备。它们仍共享 Mac 的真实蓝牙链路；不同 App 可能收到同样的通知，SimBLE 无法通用地匹配每条业务响应属于哪个 App，也不能隔离多包协议事务。关闭共享开关不会自动断开现有连接；需要先断开才能重新保证独占。
+- **能力边界：** 虚拟 UUID 不能模拟多台手机各自独立的蓝牙控制器、蓝牙地址、配对关系、设备连接数或业务层响应路由。
+
+在 macOS 上运行隔离测试：`sh Tests/run.sh`（不需要 Xcode 工程）。
+
 ## 与真机的差别
 
-- **设备 identifier 不同：** 是 Mac 那边的，和手机上的不一样。手机上存的配对记录用不了，绑定关系建立在设备和 Mac 之间。
+- **外设 identifier 不同：** App 看到的是每个模拟器 App 独立的虚拟 UUID，不是 Mac 或真机直接暴露的 UUID。手机上的配对记录用不了，实际绑定关系仍然建立在设备和 Mac 之间。
 - **没有桥接的功能：**
   - descriptor(notify 仍然通过 `setNotifyValue` 正常工作)。
   - L2CAP、connection events、状态恢复、`didModifyServices`。

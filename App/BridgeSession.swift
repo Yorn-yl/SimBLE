@@ -17,6 +17,8 @@ final class BridgeSession: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
     private let logs: LogStore
     private let selection: SelectionSnapshot
     private let directory: AppDirectory
+    private let identities: PeripheralIdentityRegistry
+    private let access: PeripheralAccessCoordinator
     private let events: Events
     private(set) var appKey: String?
     private var identity: (bundleID: String, udid: String)?
@@ -43,13 +45,15 @@ final class BridgeSession: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
     private var isClosed: Bool = false
 
     init(connection: NWConnection, number: Int, logs: LogStore, selection: SelectionSnapshot, directory: AppDirectory,
-         decoders: DecoderRegistry, events: Events) {
+         decoders: DecoderRegistry, identities: PeripheralIdentityRegistry, access: PeripheralAccessCoordinator, events: Events) {
         self.connection = connection
         self.number = number
         self.logs = logs
         self.selection = selection
         self.directory = directory
         self.decoders = decoders
+        self.identities = identities
+        self.access = access
         self.events = events
         self.queue = DispatchQueue(label: "sim-ble-bridge.session-\(number)")
         super.init()
@@ -76,11 +80,13 @@ final class BridgeSession: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
             if central.isScanning {
                 central.stopScan()
             }
-            for peripheral in peripherals.values where peripheral.state != .disconnected {
+            // A scan/retrieve does not imply ownership: only cancel our own connections.
+            for peripheral in peripherals.values where peripheral.state != .disconnected && access.holds(peripheral.identifier, session: number) {
                 central.cancelPeripheralConnection(peripheral)
             }
             log(.bridge, .app, "App disconnected", detail: "Released its Mac connections")
         }
+        access.releaseAll(session: number)
         central = nil
         peripherals.removeAll()
         connection.cancel()
@@ -109,7 +115,7 @@ final class BridgeSession: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
     }
 
     private func send(_ message: [String: Any], then completion: (() -> Void)? = nil) {
-        guard var data = try? JSONSerialization.data(withJSONObject: message) else { return }
+        guard !isClosed, var data = try? JSONSerialization.data(withJSONObject: message) else { return }
         data.append(0x0A)
         connection.send(content: data, completion: .contentProcessed { _ in
             completion?()
@@ -121,7 +127,7 @@ final class BridgeSession: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
         message["ev"] = event
         message["error"] = encode(error)
         if let peripheral {
-            message["id"] = peripheral.identifier.uuidString
+            message["id"] = virtualID(for: peripheral).uuidString
             // The MTU grows after the Mac negotiates it, so every event carries the current value.
             if peripheral.state == .connected {
                 message["mtuWith"] = peripheral.maximumWriteValueLength(for: .withResponse)
@@ -129,6 +135,11 @@ final class BridgeSession: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
             }
         }
         send(message)
+    }
+
+    private func virtualID(for peripheral: CBPeripheral) -> UUID {
+        guard let identity else { return peripheral.identifier }
+        return identities.virtualID(for: peripheral.identifier, udid: identity.udid, bundleID: identity.bundleID)
     }
 
     // MARK: Logging
@@ -173,7 +184,7 @@ final class BridgeSession: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
 
     private func label(_ peripheral: CBPeripheral?) -> String {
         guard let peripheral else { return "" }
-        let short = String(peripheral.identifier.uuidString.prefix(8))
+        let short = String(virtualID(for: peripheral).uuidString.prefix(8))
         return peripheral.name.map { "\($0) · \(short)" } ?? short
     }
 
@@ -188,7 +199,7 @@ final class BridgeSession: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
     // MARK: Commands
 
     private func handle(_ message: [String: Any]) {
-        guard let operation = message["op"] as? String else { return }
+        guard !isClosed, let operation = message["op"] as? String else { return }
         let uuids: ([String]?) -> [CBUUID]? = { strings in strings?.map(CBUUID.init(string:)) }
 
         switch operation {
@@ -200,6 +211,12 @@ final class BridgeSession: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
             return
         default:
             break
+        }
+        // A loader's hello socket is not a GATT client, and all simulated app identity
+        // must be established before any request is allowed to touch the Mac radio.
+        guard appKey != nil else {
+            close()
+            return
         }
         let central = ensureCentral()
         guard central.state == .poweredOn || operation == "retrieve" || operation == "retrieveConnected" else {
@@ -223,7 +240,12 @@ final class BridgeSession: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
             central.stopScan()
         case "retrieve":
             let identifiers = (message["ids"] as? [String] ?? []).compactMap(UUID.init(uuidString:))
-            let found = central.retrievePeripherals(withIdentifiers: identifiers)
+            // Never pass another app's virtual UUID (or an old host UUID) to CoreBluetooth.
+            let physical = identifiers.compactMap { identifier -> UUID? in
+                guard let identity else { return nil }
+                return identities.physicalID(for: identifier, udid: identity.udid, bundleID: identity.bundleID)
+            }
+            let found = central.retrievePeripherals(withIdentifiers: physical)
             log(.toDevice, .connection, "Retrieve peripherals", detail: "\(identifiers.count) requested, \(found.count) known to the Mac")
             respond(to: message, with: found)
         case "retrieveConnected":
@@ -240,31 +262,40 @@ final class BridgeSession: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
                 sendEvent("failToConnect", nil, ["id": message["id"] ?? ""], error: error)
                 return
             }
+            guard let appKey, access.acquire(peripheral.identifier, appKey: appKey, session: number) else {
+                let error = NSError(domain: CBErrorDomain, code: CBError.connectionFailed.rawValue,
+                                    userInfo: [NSLocalizedDescriptionKey: "Device is in use by another simulator app. Enable shared device connections only for multi-client testing."])
+                log(.toDevice, .connection, "Connect rejected", peripheral: peripheral, error: error)
+                sendEvent("failToConnect", nil, ["id": message["id"] ?? ""], error: error)
+                return
+            }
+            // Do not install a GATT delegate until this session has obtained a lease.
+            peripheral.delegate = self
             log(.toDevice, .connection, "Connect", peripheral: peripheral)
             central.connect(peripheral)
         case "disconnect":
-            if let peripheral = peripheral(for: message) {
+            if let peripheral = ownedPeripheral(for: message) {
                 log(.toDevice, .connection, "Disconnect", peripheral: peripheral)
                 central.cancelPeripheralConnection(peripheral)
             }
         case "discoverServices":
-            guard let peripheral = peripheral(for: message) else { return }
+            guard let peripheral = ownedPeripheral(for: message) else { return }
             let services = uuids(message["services"] as? [String])
             log(.toDevice, .gatt, "Discover services", peripheral: peripheral, detail: services?.map(\.description).joined(separator: ", ") ?? "all")
             peripheral.discoverServices(services)
         case "discoverCharacteristics":
-            guard let peripheral = peripheral(for: message), let service = service(for: message, in: peripheral) else { return }
+            guard let peripheral = ownedPeripheral(for: message), let service = service(for: message, in: peripheral) else { return }
             let characteristics = uuids(message["chars"] as? [String])
             log(.toDevice, .gatt, "Discover characteristics", peripheral: peripheral,
                 detail: "\(service.uuid): \(characteristics?.map(\.description).joined(separator: ", ") ?? "all")")
             peripheral.discoverCharacteristics(characteristics, for: service)
         case "read":
-            guard let peripheral = peripheral(for: message), let characteristic = characteristic(for: message, in: peripheral) else { return }
+            guard let peripheral = ownedPeripheral(for: message), let characteristic = characteristic(for: message, in: peripheral) else { return }
             pendingReads.insert(readKey(peripheral, characteristic))
             log(.toDevice, .data, "Read", peripheral: peripheral, detail: path(characteristic))
             peripheral.readValue(for: characteristic)
         case "write":
-            guard let peripheral = peripheral(for: message),
+            guard let peripheral = ownedPeripheral(for: message),
                   let characteristic = characteristic(for: message, in: peripheral),
                   let data = (message["data"] as? String).flatMap({ Data(base64Encoded: $0) }) else { return }
             if message["withResponse"] as? Bool == true {
@@ -279,12 +310,12 @@ final class BridgeSession: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
                 drainWrites(for: peripheral)
             }
         case "notify":
-            guard let peripheral = peripheral(for: message), let characteristic = characteristic(for: message, in: peripheral) else { return }
+            guard let peripheral = ownedPeripheral(for: message), let characteristic = characteristic(for: message, in: peripheral) else { return }
             let enabled = message["enabled"] as? Bool == true
             log(.toDevice, .gatt, enabled ? "Enable notifications" : "Disable notifications", peripheral: peripheral, detail: path(characteristic))
             peripheral.setNotifyValue(enabled, for: characteristic)
         case "readRSSI":
-            if let peripheral = peripheral(for: message) {
+            if let peripheral = ownedPeripheral(for: message) {
                 log(.toDevice, .connection, "Read RSSI", peripheral: peripheral)
                 peripheral.readRSSI()
             }
@@ -309,9 +340,20 @@ final class BridgeSession: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
     }
 
     private func register(_ message: [String: Any]) {
-        let bundleID = message["bundleId"] as? String ?? "?"
-        let udid = message["udid"] as? String ?? ""
+        // Missing values would merge independent apps into the same ownership scope.
+        guard appKey == nil,
+              let bundleID = message["bundleId"] as? String, !bundleID.isEmpty,
+              let udid = message["udid"] as? String, !udid.isEmpty else {
+            close()
+            return
+        }
         let key = AppKey.make(udid: udid, bundleID: bundleID)
+        // A shim must still be selected when it registers/reconnects. Loader checks
+        // alone are not sufficient for long-running sessions or local TCP clients.
+        guard selection.contains(key) else {
+            close()
+            return
+        }
         appKey = key
         identity = (bundleID, udid)
         log(.bridge, .app, "App connected", detail: "central #\(number), pid \(message["pid"] ?? "?")")
@@ -335,7 +377,7 @@ final class BridgeSession: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
         send([
             "re": message["req"] ?? 0,
             "peripherals": found.map { peripheral -> [String: Any] in
-                var entry: [String: Any] = ["id": peripheral.identifier.uuidString]
+                var entry: [String: Any] = ["id": virtualID(for: peripheral).uuidString]
                 entry["name"] = peripheral.name
                 return entry
             },
@@ -344,17 +386,34 @@ final class BridgeSession: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
 
     private func track(_ peripheral: CBPeripheral) {
         peripherals[peripheral.identifier] = peripheral
-        peripheral.delegate = self
+        // Scanning another app's device must not capture its GATT callback delegate.
+        if access.holds(peripheral.identifier, session: number) {
+            peripheral.delegate = self
+        }
     }
 
     private func peripheral(for message: [String: Any]) -> CBPeripheral? {
-        guard let identifier = (message["id"] as? String).flatMap(UUID.init(uuidString:)) else { return nil }
+        guard let virtual = (message["id"] as? String).flatMap(UUID.init(uuidString:)),
+              let identity,
+              let identifier = identities.physicalID(for: virtual, udid: identity.udid, bundleID: identity.bundleID) else {
+            return nil
+        }
         if let known = peripherals[identifier] {
             return known
         }
         guard let retrieved = central?.retrievePeripherals(withIdentifiers: [identifier]).first else { return nil }
         track(retrieved)
         return retrieved
+    }
+
+    private func ownedPeripheral(for message: [String: Any]) -> CBPeripheral? {
+        guard let peripheral = peripheral(for: message),
+              access.holds(peripheral.identifier, session: number) else {
+            log(.toDevice, .connection, "Ignored unowned peripheral operation",
+                detail: message["id"] as? String ?? "unknown")
+            return nil
+        }
+        return peripheral
     }
 
     private func service(for message: [String: Any], in peripheral: CBPeripheral) -> CBService? {
@@ -433,11 +492,13 @@ final class BridgeSession: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        access.release(peripheral.identifier, session: number)
         log(.fromDevice, .connection, "Failed to connect", peripheral: peripheral, error: error)
         sendEvent("failToConnect", peripheral, error: error)
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        access.release(peripheral.identifier, session: number)
         log(.fromDevice, .connection, "Disconnected", peripheral: peripheral, error: error)
         pendingWrites[peripheral.identifier] = nil
         streams = streams.filter { !$0.key.contains(peripheral.identifier.uuidString) }

@@ -23,6 +23,8 @@ final class BridgeServer {
     @ObservationIgnored private let selection: SelectionSnapshot
     @ObservationIgnored private let directory: AppDirectory
     @ObservationIgnored private let decoders: DecoderRegistry
+    @ObservationIgnored private let identities = PeripheralIdentityRegistry()
+    @ObservationIgnored private let access = PeripheralAccessCoordinator()
     @ObservationIgnored private var listener: NWListener?
     @ObservationIgnored private var sessions: [ObjectIdentifier: BridgeSession] = [:]
     @ObservationIgnored private var sessionCount: Int = 0
@@ -95,7 +97,7 @@ final class BridgeServer {
             }
         )
         let session = BridgeSession(connection: connection, number: sessionCount, logs: logs, selection: selection, directory: directory,
-                                    decoders: decoders, events: events)
+                                    decoders: decoders, identities: identities, access: access, events: events)
         sessions[ObjectIdentifier(session)] = session
         session.start()
     }

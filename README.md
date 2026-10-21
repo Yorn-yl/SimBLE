@@ -186,9 +186,18 @@ final class FooStreamDecoder: PacketDecoder {
   - Delegate callbacks arrive on the queue the app passed.
 - **Setup on launch:** the Mac app copies the loader, shim and hook to `~/Library/Application Support/SimBLE/` and points `~/.lldbinit` there, so moving or rebuilding the app keeps working. Delete the `sim_ble_inject.py` line from `~/.lldbinit` to remove the hook.
 
+## Multiple simulator apps and shared peripherals
+
+- **App-scoped UUIDs:** Each `(simulator UDID, app bundle ID, Mac peripheral)` gets a stable virtual `CBPeripheral.identifier`. Scans, callbacks and `retrievePeripherals(withIdentifiers:)` use this mapping even after restarting SimBLE. This is a simulator identity, not a hardware or bonding identity. Saved Mac UUIDs from older versions need a new scan.
+- **Exclusive by default:** Only one simulator app can own a physical peripheral at a time. Multiple `CBCentralManager` instances inside the **same app** may share it. Another app can still scan or retrieve the device but `connect` fails with an explicit CoreBluetooth error until the owner disconnects.
+- **Shared mode (unsafe):** The Bridge sidebar offers *Shared device connections (unsafe)* for deliberate multi-client tests. All clients use the Mac's physical BLE radio, and subscribed clients may see the same notifications. SimBLE cannot route application-specific command responses to the correct writer or guarantee multi-packet protocol isolation. Disabling sharing does not disconnect existing clients; disconnect them before resuming exclusive tests.
+- **Scope:** Virtual UUIDs do not emulate independent BLE controllers, phone addresses, pairing/bonding, device connection limits, or response correlation.
+
+Run the isolation tests on macOS: `sh Tests/run.sh` (no Xcode project is required).
+
 ## Differences from a phone
 
-- **Peripheral identifiers** are the Mac's, not the phone's. Pairings stored on a phone do not carry over; bonding happens between the device and the Mac.
+- **Peripheral identifiers** are virtual and scoped to each simulator app, not the phone's or the Mac's exposed IDs. Pairings stored on a phone do not carry over; actual bonding still happens between the device and the Mac.
 - **Not bridged:**
   - Descriptors (notifications still work through `setNotifyValue`).
   - L2CAP, connection events, state restoration, `didModifyServices`.
